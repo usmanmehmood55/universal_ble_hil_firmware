@@ -1,0 +1,21 @@
+{
+  "C_Cpp.default.configurationProvider" : "nordic-semiconductor.nrf-connect",
+  "nrf-connect.debugging.bindings"      : {
+    "${workspaceFolder}/build": "Launch build",
+    "${workspaceFolder}/build/sample_ble_device": "Launch sample_ble_device"
+  },
+
+  "c-cpp-flylint.cppcheck.extraArgs":
+  [
+    "--suppress=cstyleCast",
+    "--suppress=arithOperationsOnVoidPointer",
+    "--suppress=unusedStructMember",
+    "--suppress=ctuOneDefinitionRuleViolation",
+    "--suppress=variableScope",
+  ] ,
+
+  "cSpell.enabled": true,
+  "files.associations": {
+    "ble_gatt.h": "c"
+  },
+}

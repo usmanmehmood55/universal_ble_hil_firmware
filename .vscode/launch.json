@@ -1,0 +1,12 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"type": "nrf-connect",
+			"request": "launch",
+			"name": "Launch sample_ble_device",
+			"config": "${workspaceFolder}/build/${workspaceFolderBasename}",
+			"runToEntryPoint": "main"
+		}
+	]
+}

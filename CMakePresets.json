@@ -1,0 +1,23 @@
+{
+    "version"              : 2,
+    "cmakeMinimumRequired" : { "major" : 3, "minor" : 20 },
+    "configurePresets"     :
+    [
+        {
+            "name"           : "build",
+            "displayName"    : "Build for nrf52832dk_nrf52832",
+            "generator"      : "Ninja",
+            "binaryDir"      : "${sourceDir}/build",
+            "cacheVariables" :
+            {
+                "NCS_TOOLCHAIN_VERSION"              : "NONE",
+                "BOARD"                              : "nrf52832dk_nrf52832",
+                "CONFIG_CORTEX_M_DEBUG_MONITOR_HOOK" : "y",
+                "CONFIG_DEBUG_OPTIMIZATIONS"         : "y",
+                "CONFIG_DEBUG_THREAD_INFO"           : "y",
+                "CONFIG_SEGGER_DEBUGMON"             : "y",
+                "CACHED_CONF_FILE"                   : "${sourceDir}/prj.conf"
+            }
+        }
+    ]
+}

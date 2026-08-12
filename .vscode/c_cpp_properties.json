@@ -1,0 +1,10 @@
+{
+    "configurations": [
+        {
+            "name"             : "nRF Connect SDK",
+            "intelliSenseMode" : "gcc-arm",
+            "compileCommands"  : "build/compile_commands.json"
+        }
+    ],
+    "version": 4
+}

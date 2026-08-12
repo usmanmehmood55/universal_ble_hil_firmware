@@ -1,0 +1,4 @@
+build
+.DS_Store
+.venv
+.zephyr-workspace
