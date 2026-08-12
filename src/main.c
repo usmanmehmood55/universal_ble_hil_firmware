@@ -33,6 +33,10 @@ enum hil_command
     HIL_COMMAND_NOTIFY_SCRIPT   = 0x09,
     HIL_COMMAND_NOTIFY_ON_SUBSCRIBE = 0x0a,
     HIL_COMMAND_SET_AUXILIARY_SERVICE = 0x0b,
+    HIL_COMMAND_SCHEDULE_AUXILIARY_SERVICE = 0x0c,
+    HIL_COMMAND_ARM_CCC_DELAY = 0x0d,
+    HIL_COMMAND_ARM_DESCRIPTOR_READ_FAULT = 0x0e,
+    HIL_COMMAND_ARM_DESCRIPTOR_WRITE_FAULT = 0x0f,
 };
 
 struct hil_operation_fault
@@ -53,6 +57,8 @@ struct hil_state
     uint16_t write_without_response_length;
     uint8_t multi_value[HIL_MAX_VALUE_LENGTH];
     uint16_t multi_length;
+    uint8_t descriptor_value[HIL_MAX_VALUE_LENGTH];
+    uint16_t descriptor_length;
     uint32_t writes_with_response;
     uint32_t writes_without_response;
     bool notify_enabled;
@@ -77,8 +83,11 @@ static struct bt_gatt_indicate_params indication_params;
 static uint8_t indication_value[HIL_MAX_VALUE_LENGTH];
 static struct hil_operation_fault read_fault;
 static struct hil_operation_fault write_fault;
+static struct hil_operation_fault descriptor_read_fault;
+static struct hil_operation_fault descriptor_write_fault;
 static bool notify_on_subscribe_armed;
 static bool auxiliary_service_requested;
+static uint16_t ccc_delay_ms;
 
 #define HIL_UUID(value) BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x7e570000 + (value), 0x7e57, 0x4e57, 0x8e57, 0x7e5700000001))
 
@@ -95,6 +104,7 @@ static struct bt_uuid_128 indicate_uuid                      = HIL_UUID(0x0a);
 static struct bt_uuid_128 multi_uuid                         = HIL_UUID(0x0b);
 static struct bt_uuid_128 auxiliary_service_uuid             = HIL_UUID(0x0c);
 static struct bt_uuid_128 auxiliary_read_uuid                = HIL_UUID(0x0d);
+static struct bt_uuid_128 descriptor_uuid                    = HIL_UUID(0x0e);
 
 static ssize_t read_auxiliary(struct bt_conn *conn,
                               const struct bt_gatt_attr *attr, void *buf,
@@ -141,6 +151,7 @@ static void reset_state(void)
 {
     static const uint8_t initial_read_value[] = "HIL-READ-V1";
     static const uint8_t initial_multi_value[] = "MULTI-V1";
+    static const uint8_t initial_descriptor_value[] = "HIL-DESCRIPTOR-V1";
     bool notify_enabled = state.notify_enabled;
     bool indicate_enabled = state.indicate_enabled;
     bool multi_notify_enabled = state.multi_notify_enabled;
@@ -152,6 +163,9 @@ static void reset_state(void)
     state.read_length = sizeof(initial_read_value) - 1;
     memcpy(state.multi_value, initial_multi_value, sizeof(initial_multi_value) - 1);
     state.multi_length = sizeof(initial_multi_value) - 1;
+    memcpy(state.descriptor_value, initial_descriptor_value,
+           sizeof(initial_descriptor_value) - 1);
+    state.descriptor_length = sizeof(initial_descriptor_value) - 1;
     state.notify_enabled = notify_enabled;
     state.indicate_enabled = indicate_enabled;
     state.multi_notify_enabled = multi_notify_enabled;
@@ -161,8 +175,11 @@ static void reset_state(void)
     burst_uses_script = false;
     memset(&read_fault, 0, sizeof(read_fault));
     memset(&write_fault, 0, sizeof(write_fault));
+    memset(&descriptor_read_fault, 0, sizeof(descriptor_read_fault));
+    memset(&descriptor_write_fault, 0, sizeof(descriptor_write_fault));
     notify_on_subscribe_armed = false;
     auxiliary_service_requested = false;
+    ccc_delay_ms = 0;
 }
 
 static ssize_t apply_operation_fault(struct hil_operation_fault *fault)
@@ -227,6 +244,39 @@ static ssize_t read_write_mirror(struct bt_conn *conn, const struct bt_gatt_attr
                                  void *buf, uint16_t len, uint16_t offset)
 {
     return read_buffer(conn, attr, buf, len, offset, state.write_value, state.write_length);
+}
+
+static ssize_t store_write(const void *buf, uint16_t len, uint16_t offset,
+                           uint8_t *target, uint16_t *target_length);
+
+static ssize_t read_descriptor_value(struct bt_conn *conn,
+                                     const struct bt_gatt_attr *attr,
+                                     void *buf, uint16_t len, uint16_t offset)
+{
+    ssize_t fault_result = apply_operation_fault(&descriptor_read_fault);
+    if (fault_result < 0)
+    {
+        return fault_result;
+    }
+    return read_buffer(conn, attr, buf, len, offset, state.descriptor_value,
+                       state.descriptor_length);
+}
+
+static ssize_t write_descriptor_value(struct bt_conn *conn,
+                                      const struct bt_gatt_attr *attr,
+                                      const void *buf, uint16_t len,
+                                      uint16_t offset, uint8_t flags)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(attr);
+    ARG_UNUSED(flags);
+    ssize_t fault_result = apply_operation_fault(&descriptor_write_fault);
+    if (fault_result < 0)
+    {
+        return fault_result;
+    }
+    return store_write(buf, len, offset, state.descriptor_value,
+                       &state.descriptor_length);
 }
 
 static ssize_t read_write_without_response_mirror(struct bt_conn *conn,
@@ -510,16 +560,48 @@ static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *at
         auxiliary_service_requested = payload[0] != 0;
         k_work_reschedule(&auxiliary_service_work, K_MSEC(25));
         break;
+    case HIL_COMMAND_SCHEDULE_AUXILIARY_SERVICE:
+        if (payload_length != 3 || payload[0] > 1)
+        {
+            return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+        }
+        auxiliary_service_requested = payload[0] != 0;
+        k_work_reschedule(&auxiliary_service_work,
+                          K_MSEC(sys_get_le16(&payload[1])));
+        break;
+    case HIL_COMMAND_ARM_CCC_DELAY:
+        if (payload_length != 2)
+        {
+            return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+        }
+        ccc_delay_ms = sys_get_le16(payload);
+        break;
     case HIL_COMMAND_ARM_READ_FAULT:
     case HIL_COMMAND_ARM_WRITE_FAULT:
+    case HIL_COMMAND_ARM_DESCRIPTOR_READ_FAULT:
+    case HIL_COMMAND_ARM_DESCRIPTOR_WRITE_FAULT:
     {
         if (payload_length != 5)
         {
             return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
         }
-        struct hil_operation_fault *fault = command[0] == HIL_COMMAND_ARM_READ_FAULT
-                                                ? &read_fault
-                                                : &write_fault;
+        struct hil_operation_fault *fault;
+        if (command[0] == HIL_COMMAND_ARM_READ_FAULT)
+        {
+            fault = &read_fault;
+        }
+        else if (command[0] == HIL_COMMAND_ARM_WRITE_FAULT)
+        {
+            fault = &write_fault;
+        }
+        else if (command[0] == HIL_COMMAND_ARM_DESCRIPTOR_READ_FAULT)
+        {
+            fault = &descriptor_read_fault;
+        }
+        else
+        {
+            fault = &descriptor_write_fault;
+        }
         fault->att_error = payload[0];
         fault->delay_ms = sys_get_le16(&payload[1]);
         fault->disconnect_after_ms = sys_get_le16(&payload[3]);
@@ -535,6 +617,12 @@ static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *at
 static void notify_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
     ARG_UNUSED(attr);
+    if (ccc_delay_ms > 0)
+    {
+        uint16_t delay_ms = ccc_delay_ms;
+        ccc_delay_ms = 0;
+        k_sleep(K_MSEC(delay_ms));
+    }
     state.notify_enabled = value == BT_GATT_CCC_NOTIFY;
     if (state.notify_enabled && notify_on_subscribe_armed)
     {
@@ -571,7 +659,11 @@ BT_GATT_SERVICE_DEFINE(hil_service,
                        BT_GATT_CHARACTERISTIC(&read_uuid.uuid, BT_GATT_CHRC_READ,
                                               BT_GATT_PERM_READ, read_value, NULL, NULL),
                        BT_GATT_DESCRIPTOR(BT_UUID_GATT_CUD, BT_GATT_PERM_READ,
-                                          bt_gatt_attr_read_cud, NULL, "Deterministic read value"),
+                                           bt_gatt_attr_read_cud, NULL, "Deterministic read value"),
+                       BT_GATT_DESCRIPTOR(&descriptor_uuid.uuid,
+                                          BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+                                          read_descriptor_value,
+                                          write_descriptor_value, NULL),
                        BT_GATT_CHARACTERISTIC(&write_uuid.uuid, BT_GATT_CHRC_WRITE,
                                               BT_GATT_PERM_WRITE, NULL, write_value, NULL),
                        BT_GATT_CHARACTERISTIC(&write_without_response_uuid.uuid,
@@ -596,12 +688,12 @@ BT_GATT_SERVICE_DEFINE(hil_service,
 
 static const struct bt_gatt_attr *notify_attribute(void)
 {
-    return &hil_service.attrs[17];
+    return &hil_service.attrs[18];
 }
 
 static const struct bt_gatt_attr *indicate_attribute(void)
 {
-    return &hil_service.attrs[20];
+    return &hil_service.attrs[21];
 }
 
 static const struct bt_data advertising_data[] = {

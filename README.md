@@ -49,6 +49,12 @@ west build `
   ..
 ```
 
+### Note
+
+A pre-compiled binary file should be available in the
+[GitHub Releases](https://github.com/usmanmehmood55/universal_ble_hil_firmware/releases/latest),
+it can be flashed directly if building from source is not possible.
+
 ## 3. Implemented fixture behavior
 
 The firmware has:

@@ -43,6 +43,8 @@ bytes are its payload. All 16-bit integers are little-endian.
 | `09`   | Notification script | Size, interval, count, sequence numbers      | Emit caller-selected application sequence numbers  |
 | `0a`   | Notify on subscribe | None                                         | Emit `CCC-ENABLED` from the next notification CCC enable callback |
 | `0b`   | Set auxiliary service | One byte: `00` disabled or `01` enabled    | Dynamically remove or add the auxiliary GATT service |
+| `0c`   | Schedule auxiliary service | Enabled byte and delay, `uint16`        | Change the auxiliary service after the requested delay |
+| `0d`   | Arm CCC delay       | Delay in milliseconds, `uint16`              | Delay the next notification CCC callback             |
 
 The fault-command payload is five bytes: one ATT error byte, a `uint16`
 callback delay in milliseconds, and a `uint16` peripheral-disconnect delay. An
@@ -75,6 +77,10 @@ database. Zephyr emits the standard Service Changed indication. The auxiliary
 service UUID ends in `000c`; its readable characteristic UUID ends in `000d`
 and returns `AUXILIARY-V1`.
 
+`Schedule auxiliary service` lets a Service Changed indication overlap an
+active read, write, or subscription operation. `Arm CCC delay` is one-shot and
+delays the next notification enable or disable callback.
+
 ## 3. State value
 
 The state characteristic returns 16 bytes:
@@ -100,5 +106,6 @@ The state characteristic returns 16 bytes:
 - Armed read and write faults: cleared
 - Notify-on-subscribe plan: cleared
 - Auxiliary service: removed through delayed work
+- Armed CCC delay: cleared
 
 CCC flags continue to reflect the active connection because reset does not unsubscribe the client.
