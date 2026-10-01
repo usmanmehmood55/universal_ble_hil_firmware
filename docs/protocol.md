@@ -4,7 +4,7 @@
 
 - Device name: `UniversalBLE-HIL`
 - Manufacturer ID bytes: `57 7e`
-- Manufacturer payload: contract revision `01 00`
+- Manufacturer payload: contract revision `03 00`
 - Service UUID: `7e570001-7e57-4e57-8e57-7e5700000001`
 
 All characteristic UUIDs share that base and change the first field:
@@ -45,6 +45,15 @@ bytes are its payload. All 16-bit integers are little-endian.
 | `0b`   | Set auxiliary service | One byte: `00` disabled or `01` enabled    | Dynamically remove or add the auxiliary GATT service |
 | `0c`   | Schedule auxiliary service | Enabled byte and delay, `uint16`        | Change the auxiliary service after the requested delay |
 | `0d`   | Arm CCC delay       | Delay in milliseconds, `uint16`              | Delay the next notification CCC callback             |
+| `0e` | Arm descriptor read fault | Same five-byte fault payload | Alter the next descriptor read |
+| `0f` | Arm descriptor write fault | Same five-byte fault payload | Alter the next descriptor write |
+| `10` | Indicate on subscribe | None | Send `IND-CCC-ENABLED` inside the next indication CCC-enable callback |
+| `11` | Indication scenario | Action byte: 1 disconnect, 2 reboot, 3 competing send | Queue `IND-FIRST`, then act before this RX callback can process its confirmation |
+| `12` | Arm CCC fault | Action (1 disconnect, 2 reboot), trigger delay `uint16`, callback delay `uint16` | One-shot fault starts inside the next notification CCC callback, not during setup |
+| `13` | Set long value | Length `uint16`, 0..512 | Fill the read value with byte `index & 0xff` without sending a large control write |
+| `14` | Notification pressure | None | Attempt 128 notification sends with completion callbacks in one system-workqueue invocation |
+| `15` | Arm next connection fault | Delay `uint16` | One-shot plan survives host disconnect and starts its disconnect timer inside the next connection callback |
+| `16` | Arm service-declaration fault | Five-byte fault payload | Alter the next read of the HIL primary-service declaration, including uncached service discovery |
 
 The fault-command payload is five bytes: one ATT error byte, a `uint16`
 callback delay in milliseconds, and a `uint16` peripheral-disconnect delay. An
@@ -109,3 +118,80 @@ The state characteristic returns 16 bytes:
 - Armed CCC delay: cleared
 
 CCC flags continue to reflect the active connection because reset does not unsubscribe the client.
+
+## 5. Revision 2 telemetry and long values
+
+The read-only telemetry characteristic is `7e57000f-7e57-4e57-8e57-7e5700000001`.
+It returns 36 bytes, all integers little-endian:
+
+| Offset | Type | Meaning |
+| ------ | ---- | ------- |
+| 0 | uint16 | Indication parameters still owned by Zephyr (0 or 1) |
+| 2 | uint16 | Successfully confirmed indications |
+| 4 | uint16 | Competing sends rejected while parameters were busy |
+| 6 | uint16 | Indication scenario triggered while an indication was pending |
+| 8 | uint16 | CCC fault callbacks triggered |
+| 10 | uint32 | Boot count retained in no-init RAM across software reboot |
+| 14 | uint16 | Oversized writes rejected by the fixture |
+| 16 | uint16 | Pressure notifications accepted |
+| 18 | uint16 | Pressure sends rejected with `-ENOMEM` |
+| 20 | uint16 | Pressure notification completion callbacks |
+| 22 | uint16 | Other pressure-send errors (test expects zero) |
+| 24 | uint16 | Next-connection fault callbacks triggered |
+| 26 | uint16 | Service-declaration fault callbacks triggered |
+| 28 | uint16 | Physical disconnect callbacks since reset |
+| 30 | uint16 | Disconnect timers armed since reset |
+| 32 | uint16 | Disconnect timer attempts on the retained original connection |
+| 34 | uint16 | Disconnect timers cancelled before execution |
+
+Disconnect timers retain the connection that was active when armed. Closing
+that link cancels its pending timer; work already executing can only target its
+retained original link. It cannot disconnect a replacement connection. Reset
+cancels pending timers and clears all three timer counters. Rescheduling a timer
+replaces the previous plan; the counter accounting used by CONN-007 assumes one
+armed plan per reset.
+
+Reset clears the event counters and fault plans, but never clears an indication
+pending flag while Zephyr still owns its parameters. Only the indication destroy
+callback releases that ownership. The boot count is diagnostic, not persistent
+storage: it is not guaranteed to survive power loss or reflashing.
+
+Read values now accept up to 512 bytes. The write-with-response value and its
+mirror have a deliberately smaller 384-byte limit, allowing a valid 385-byte
+ATT write to demonstrate peripheral rejection without exceeding the protocol's
+512-byte limit. The telemetry counter proves that rejection reached the fixture.
+The write-with-response
+characteristic validates Prepare Writes without modifying the mirror; data is
+stored only when Zephyr executes the prepared write. Notification bursts remain
+limited to 244 bytes. Oversized writes return an ATT length error.
+
+Timing sweeps use 300 ms blocked callbacks and disconnect offsets of 0, 25, 100,
+and 350 ms. The timer is started by the target callback, so BLE setup latency
+does not shift the intended fault point. The 350 ms case is after callback return;
+host completion can still lose the race with transport delivery of the response.
+
+## 6. Explicit unattended limitations
+
+This profile does not implement SMP, encrypted attributes, persistent bonds or
+passkey control. Windows pairing consent is not automated. SMP cases are skipped
+with a reason, not counted as implemented tests.
+
+Windows MTU queries read local metadata, without a server callback to interrupt.
+The public host API cannot retain raw Prepare Writes to exhaust a server queue.
+Successful bursts alone do not prove buffer exhaustion. The pressure command
+uses `bt_gatt_notify_cb` from the system workqueue, where resource allocation is
+nonblocking and completion callbacks cannot run until the batch returns. The
+test requires observed `-ENOMEM`, accepted sends, completion of every accepted
+send, exact received payloads, and subsequent successful notifications and GATT.
+
+The next-connection fault is armed over BLE before host disconnect. Discovery
+faults use a custom primary-service declaration read callback that delegates to
+Zephyr's normal service reader after applying the one-shot plan. Windows tests
+exercise uncached discovery inside `connect`; public `discoverServices` can
+return cached metadata without reading the declaration over the radio.
+The connection/discovery sweep waits for fixture advertising before its next
+connect attempt. Windows can retry a connection before Dart emits a connected
+event; the test therefore checks that the fixture saw the fault and at least
+two physical disconnects (the deliberate host disconnect plus the fault), then
+checks a usable connection. A Dart `false` event is not required for a failed
+attempt that was never exposed as connected.

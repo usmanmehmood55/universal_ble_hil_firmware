@@ -3,6 +3,9 @@
 This is the nRF52 firmware used by the `universal_ble` hardware-in-the-loop
 baseline and fault injection tests (FIT).
 
+This is fixture v2 (contract revision 2), following the original v1 contract.
+Use the matching v2 Flutter HIL harness; it rejects a mismatched revision.
+
 The nRF52DK advertises as `UniversalBLE-HIL` and exposes one custom GATT service.
 The tests control it through BLE. USB serial is only there for Zephyr logs.
 
