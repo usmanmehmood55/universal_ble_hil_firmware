@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -9,11 +10,15 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/sys/ring_buffer.h>
 
 LOG_MODULE_REGISTER(universal_ble_hil, LOG_LEVEL_INF);
 
@@ -344,10 +349,10 @@ static ssize_t read_hil_service(struct bt_conn *conn, const struct bt_gatt_attr 
     return bt_gatt_attr_read_service(conn, attr, buf, len, offset);
 }
 
-static ssize_t read_telemetry(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                             void *buf, uint16_t len, uint16_t offset)
+#define HIL_TELEMETRY_LENGTH 36
+
+static void fill_telemetry(uint8_t *value)
 {
-    uint8_t value[36];
     sys_put_le16(atomic_get(&indication_pending), &value[0]);
     sys_put_le16(atomic_get(&indication_completed), &value[2]);
     sys_put_le16(atomic_get(&indication_rejected), &value[4]);
@@ -365,6 +370,13 @@ static ssize_t read_telemetry(struct bt_conn *conn, const struct bt_gatt_attr *a
     sys_put_le16(atomic_get(&disconnect_timers_armed), &value[30]);
     sys_put_le16(atomic_get(&disconnect_timers_attempted), &value[32]);
     sys_put_le16(atomic_get(&disconnect_timers_cancelled), &value[34]);
+}
+
+static ssize_t read_telemetry(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                             void *buf, uint16_t len, uint16_t offset)
+{
+    uint8_t value[HIL_TELEMETRY_LENGTH];
+    fill_telemetry(value);
     return read_buffer(conn, attr, buf, len, offset, value, sizeof(value));
 }
 
@@ -523,13 +535,24 @@ static void disconnect_work_handler(struct k_work *work)
 static const struct bt_gatt_attr *notify_attribute(void);
 static const struct bt_gatt_attr *indicate_attribute(void);
 
+static struct bt_conn *reference_active_connection(void)
+{
+    k_spinlock_key_t key = k_spin_lock(&disconnect_lock);
+    struct bt_conn *conn = active_connection ? bt_conn_ref(active_connection) : NULL;
+    k_spin_unlock(&disconnect_lock, key);
+    return conn;
+}
+
 static int send_notification(const uint8_t *value, uint16_t length)
 {
-    if (active_connection == NULL)
+    struct bt_conn *conn = reference_active_connection();
+    if (conn == NULL)
     {
         return -ENOTCONN;
     }
-    return bt_gatt_notify(active_connection, notify_attribute(), value, length);
+    int err = bt_gatt_notify(conn, notify_attribute(), value, length);
+    bt_conn_unref(conn);
+    return err;
 }
 
 static void pressure_notify_complete(struct bt_conn *conn, void *user_data)
@@ -583,13 +606,20 @@ static void reboot_work_handler(struct k_work *work)
 
 static int send_indication(const uint8_t *value, uint16_t length)
 {
-    if (active_connection == NULL || length > sizeof(indication_value))
+    struct bt_conn *conn = reference_active_connection();
+    if (conn == NULL)
     {
         return -ENOTCONN;
+    }
+    if (length > sizeof(indication_value))
+    {
+        bt_conn_unref(conn);
+        return -EMSGSIZE;
     }
     if (!atomic_cas(&indication_pending, 0, 1))
     {
         atomic_inc(&indication_rejected);
+        bt_conn_unref(conn);
         return -EBUSY;
     }
     memcpy(indication_value, value, length);
@@ -599,7 +629,8 @@ static int send_indication(const uint8_t *value, uint16_t length)
     indication_params.destroy = indication_destroy;
     indication_params.data = indication_value;
     indication_params.len  = length;
-    int err = bt_gatt_indicate(active_connection, &indication_params);
+    int err = bt_gatt_indicate(conn, &indication_params);
+    bt_conn_unref(conn);
     if (err != 0) atomic_clear(&indication_pending);
     return err;
 }
@@ -649,19 +680,8 @@ static void burst_work_handler(struct k_work *work)
     }
 }
 
-static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                             const void *buf, uint16_t len, uint16_t offset,
-                             uint8_t flags)
+static ssize_t execute_control(const uint8_t *command, uint16_t len, bool *reboot)
 {
-    ARG_UNUSED(conn);
-    ARG_UNUSED(attr);
-    ARG_UNUSED(flags);
-    if (offset != 0 || len == 0)
-    {
-        return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-    }
-
-    const uint8_t *command = buf;
     const uint8_t *payload = command + 1;
     uint16_t payload_length = len - 1;
 
@@ -813,11 +833,21 @@ static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *at
         static const uint8_t second[] = "IND-SECOND";
         if (send_indication(first, sizeof(first) - 1) != 0)
             return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-        // This RX callback cannot process the confirmation until it returns.
         if (!atomic_get(&indication_pending)) return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
         atomic_inc(&indication_fault_triggered);
-        if (payload[0] == 1) bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        else if (payload[0] == 2) sys_reboot(SYS_REBOOT_COLD);
+        if (payload[0] == 1)
+        {
+            struct bt_conn *conn = reference_active_connection();
+            if (conn == NULL) return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+            int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            bt_conn_unref(conn);
+            if (err != 0) return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+        }
+        else if (payload[0] == 2)
+        {
+            if (reboot == NULL) sys_reboot(SYS_REBOOT_COLD);
+            *reboot = true;
+        }
         else if (send_indication(second, sizeof(second) - 1) != -EBUSY)
             return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
         break;
@@ -863,6 +893,117 @@ static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *at
         return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
     }
     return len;
+}
+
+static ssize_t write_control(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                             const void *buf, uint16_t len, uint16_t offset,
+                             uint8_t flags)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(attr);
+    ARG_UNUSED(flags);
+    return offset || !len ? BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET)
+                         : execute_control(buf, len, NULL);
+}
+
+/* UART requests: eight hex request-ID digits, a space, and hex command bytes. */
+RING_BUF_DECLARE(serial_rx, 2048);
+K_SEM_DEFINE(serial_received, 0, 1);
+
+static void serial_rx_ready(const struct device *uart, void *user_data)
+{
+    ARG_UNUSED(user_data);
+    if (!uart_irq_update(uart) || !uart_irq_rx_ready(uart)) return;
+    uint8_t bytes[32];
+    int count;
+    while ((count = uart_fifo_read(uart, bytes, sizeof(bytes))) > 0)
+    {
+        ring_buf_put(&serial_rx, bytes, count);
+    }
+    k_sem_give(&serial_received);
+}
+
+static void serial_control(void)
+{
+    const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    static char line[9 + 2 * (HIL_MAX_VALUE_LENGTH + 1)];
+    static uint8_t command[HIL_MAX_VALUE_LENGTH + 1];
+    size_t length = 0;
+    bool overflow = false;
+    unsigned char byte;
+    if (!device_is_ready(uart) ||
+        uart_irq_callback_user_data_set(uart, serial_rx_ready, NULL) != 0)
+    {
+        LOG_ERR("Could not initialize HIL UART");
+        return;
+    }
+    uart_irq_rx_enable(uart);
+
+    while (true)
+    {
+        if (ring_buf_get(&serial_rx, &byte, 1) == 0)
+        {
+            k_sem_take(&serial_received, K_FOREVER);
+            continue;
+        }
+        if (byte != '\n')
+        {
+            if (length < sizeof(line)) line[length++] = byte;
+            else overflow = true;
+            continue;
+        }
+        if (!overflow && length > 9 && line[8] == ' ')
+        {
+            line[8] = '\0';
+            char *end;
+            unsigned long id = strtoul(line, &end, 16);
+            if (end != line + 8)
+            {
+                length = 0;
+                continue;
+            }
+            size_t count = hex2bin(line + 9, length - 9, command, sizeof(command));
+            if (count == 1 && command[0] == 0xff)
+            {
+                bt_addr_le_t identity;
+                size_t identities = 1;
+                char address[BT_ADDR_STR_LEN];
+                bt_id_get(&identity, &identities);
+                bt_addr_to_str(&identity.a, address, sizeof(address));
+                printk("HIL %08lx READY %d %s\n", id, HIL_CONTRACT_REVISION, address);
+            }
+            else if (count == 1 && command[0] == 0xfe)
+            {
+                uint8_t value[HIL_TELEMETRY_LENGTH];
+                char hex[2 * sizeof(value) + 1];
+                fill_telemetry(value);
+                bin2hex(value, sizeof(value), hex, sizeof(hex));
+                printk("HIL %08lx TELEMETRY %s\n", id, hex);
+            }
+            else
+            {
+                bool reboot = false;
+                bool indication = count && command[0] == HIL_COMMAND_INDICATION_SCENARIO;
+                // Keep the indication sequence together before the BLE RX
+                // thread can consume its confirmation.
+                if (indication) k_sched_lock();
+                ssize_t result = count ? execute_control(command, count, &reboot) : -EINVAL;
+                if (reboot)
+                {
+                    // Deferred Zephyr logging could lose this ACK on reset.
+                    char reply[24];
+                    snprintk(reply, sizeof(reply), "\nHIL %08lx 0\n", id);
+                    for (const char *p = reply; *p; p++) uart_poll_out(uart, *p);
+                    k_busy_wait(200); // Allow the last UART character to leave.
+                    sys_reboot(SYS_REBOOT_COLD);
+                }
+                if (indication) k_sched_unlock();
+                printk("HIL %08lx %d\n", id, result < 0 ? (int)result : 0);
+            }
+        }
+        length = 0;
+        overflow = false;
+    }
 }
 
 static void notify_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
@@ -1091,5 +1232,6 @@ int main(void)
 
     LOG_INF("Universal BLE HIL peripheral ready (contract revision %d)",
             HIL_CONTRACT_REVISION);
+    serial_control();
     return 0;
 }

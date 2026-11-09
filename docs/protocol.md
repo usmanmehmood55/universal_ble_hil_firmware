@@ -4,7 +4,7 @@
 
 - Device name: `UniversalBLE-HIL`
 - Manufacturer ID bytes: `57 7e`
-- Manufacturer payload: contract revision `03 00`
+- Manufacturer payload: contract revision `02 00`
 - Service UUID: `7e570001-7e57-4e57-8e57-7e5700000001`
 
 All characteristic UUIDs share that base and change the first field:
@@ -27,8 +27,22 @@ For example, the notification UUID is
 
 ## 2. Control commands
 
-Commands are binary writes. The first byte is the opcode and the remaining
-bytes are its payload. All 16-bit integers are little-endian.
+The first byte is the opcode and the remaining bytes are its payload.
+All 16-bit integers are little-endian. The legacy BLE transport writes those
+bytes directly to the control characteristic.
+
+For UART, open the DK's virtual COM port at 115200 baud with DTR asserted.
+Send one LF-terminated line per request: eight hexadecimal request-ID digits,
+a space, and the command bytes encoded as hex. For example, `00000001 01`
+requests a fixture reset (not a reboot). Wait for the matching response
+`HIL <id> <status>` before sending another request. Status zero means the
+fixture accepted the command; a negative status means the fixture rejected
+it. Acceptance does not prove a scheduled action fired.
+Unrelated output is Zephyr logging. A UART-only opcode `ff` with no payload
+returns `HIL <id> READY 2 <BLE address>`.
+UART-only opcode `fe` with no payload returns `HIL <id> TELEMETRY <hex>`,
+where the hex encodes the same 36 bytes as the BLE telemetry characteristic.
+It can be read with no BLE connection.
 
 | Opcode | Name                | Payload                                      | Effect                                             |
 | ------ | ------------------- | -------------------------------------------- | -------------------------------------------------- |
